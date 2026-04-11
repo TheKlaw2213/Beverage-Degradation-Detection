@@ -1,0 +1,620 @@
+"""
+BDI (Beverage Degradation Index) Estimator
+Single-file Flask app that matches an uploaded drink photo against reference
+images and reports the estimated BDI.
+"""
+import os
+import re
+import cv2
+import numpy as np
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
+
+app = Flask(__name__)
+
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+
+# Dropdown drinks: display label -> filename prefix in /images
+DRINKS = {
+    "water":       "Water",
+    "cokezero":    "Coke Zero Bottle",
+    "cocacola":    "Coke Classic Can",
+    "cocacolab":   "Coke Classic Bottle",
+    "orangesoda":  "Sunkist Orange Soda",
+    "applejuice":  "Snapple Apple Juice",
+    "gatorade":    "Gatorade Glacier Freeze",
+}
+
+BDI_REGEX = re.compile(r"\|BDI_(\d+)\|")
+
+
+def compute_hist(img_path):
+    """Compute a normalized 3D HSV color histogram for an image."""
+    img = cv2.imread(img_path)
+    if img is None:
+        return None
+    img = cv2.resize(img, (256, 256))
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8],
+                        [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
+
+
+def compute_hist_from_bytes(data):
+    """Compute histogram directly from uploaded bytes."""
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    img = cv2.resize(img, (256, 256))
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8],
+                        [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
+
+
+# Scan reference images on startup: filename -> (bdi, histogram)
+REFERENCE = {}
+
+
+def load_references():
+    if not os.path.isdir(IMAGES_DIR):
+        print(f"[warn] images dir not found: {IMAGES_DIR}")
+        return
+    for fname in sorted(os.listdir(IMAGES_DIR)):
+        if fname.startswith("."):
+            continue
+        if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+        m = BDI_REGEX.search(fname)
+        if not m:
+            # skip files that don't carry a BDI tag (e.g. open-container refs)
+            continue
+        bdi = int(m.group(1))
+        hist = compute_hist(os.path.join(IMAGES_DIR, fname))
+        if hist is None:
+            continue
+        REFERENCE[fname] = (bdi, hist)
+    print(f"[info] loaded {len(REFERENCE)} reference images")
+
+
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BDI Estimator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --accent: #4ade80;
+    --accent-soft: rgba(74, 222, 128, 0.14);
+    --text: #e6edf3;
+    --muted: rgba(230, 237, 243, 0.55);
+    --glass: rgba(255, 255, 255, 0.04);
+    --glass-strong: rgba(255, 255, 255, 0.07);
+    --stroke: rgba(255, 255, 255, 0.10);
+    --stroke-strong: rgba(255, 255, 255, 0.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    color: var(--text);
+    background: #05080c;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 56px 20px 80px;
+    position: relative;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* ambient color blobs for the glass to pick up */
+  body::before, body::after {
+    content: ""; position: fixed; z-index: -1;
+    width: 620px; height: 620px; border-radius: 50%;
+    filter: blur(120px); opacity: .55; pointer-events: none;
+  }
+  body::before {
+    background: radial-gradient(circle, #16d47a 0%, transparent 65%);
+    top: -180px; left: -140px;
+  }
+  body::after {
+    background: radial-gradient(circle, #0e7f55 0%, transparent 65%);
+    bottom: -220px; right: -160px; opacity: .4;
+  }
+
+  .wrap { width: 100%; max-width: 540px; }
+  .header { text-align: center; margin-bottom: 28px; }
+  h1 {
+    font-weight: 700; letter-spacing: -0.03em;
+    font-size: 34px; margin: 0 0 8px;
+    background: linear-gradient(180deg, #ffffff 0%, #b7c2cf 100%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .sub { color: var(--muted); font-size: 14px; margin: 0; }
+
+  /* Glass card */
+  .card {
+    position: relative;
+    background: var(--glass);
+    backdrop-filter: blur(28px) saturate(140%);
+    -webkit-backdrop-filter: blur(28px) saturate(140%);
+    border: 1px solid var(--stroke);
+    border-radius: 22px;
+    padding: 26px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.06) inset,
+      0 30px 60px -20px rgba(0,0,0,0.6),
+      0 10px 30px -10px rgba(0,0,0,0.4);
+  }
+  .card::before {
+    content: ""; position: absolute; inset: 0;
+    border-radius: 22px; pointer-events: none;
+    background: linear-gradient(180deg, rgba(255,255,255,0.05), transparent 40%);
+  }
+
+  label {
+    display:block; font-size: 12px; color: var(--muted);
+    margin: 16px 0 8px;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    font-weight: 500;
+  }
+  label:first-child, form > label:first-of-type { margin-top: 2px; }
+
+  .field {
+    width: 100%;
+    background: var(--glass-strong);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    color: var(--text);
+    border: 1px solid var(--stroke);
+    border-radius: 12px;
+    padding: 13px 14px;
+    font-size: 15px;
+    font-family: inherit;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .field:hover { border-color: var(--stroke-strong); }
+  .field:focus { outline: none; border-color: rgba(74, 222, 128, 0.55); }
+
+  select.field {
+    appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' stroke='%23e6edf3' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    padding-right: 38px;
+  }
+  select.field option { background: #0b1117; color: var(--text); }
+
+  input[type=file].field { padding: 11px 14px; }
+  input[type=file].field::file-selector-button {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: 1px solid rgba(74, 222, 128, 0.35);
+    border-radius: 8px;
+    padding: 6px 12px;
+    margin-right: 12px;
+    font-family: inherit; font-size: 13px; font-weight: 600;
+    cursor: pointer;
+  }
+
+  /* Buttons */
+  .btn {
+    width: 100%;
+    border-radius: 12px;
+    padding: 13px 16px;
+    font-size: 15px; font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: transform .05s ease, filter .2s ease, background .2s ease, border-color .2s ease;
+    border: 1px solid var(--stroke);
+    background: var(--glass-strong);
+    color: var(--text);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .btn:hover { border-color: var(--stroke-strong); background: rgba(255,255,255,0.09); }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+
+  .btn-primary {
+    margin-top: 22px;
+    background: linear-gradient(180deg, #5eea92 0%, #31c56c 100%);
+    color: #05210f;
+    border: 1px solid rgba(255,255,255,0.25);
+    box-shadow: 0 8px 24px -8px rgba(74, 222, 128, 0.6), 0 1px 0 rgba(255,255,255,0.3) inset;
+  }
+  .btn-primary:hover { filter: brightness(1.06); background: linear-gradient(180deg, #6ff09e 0%, #36d276 100%); }
+
+  .btn-ghost {
+    background: transparent; color: var(--muted);
+  }
+  .btn-ghost:hover { color: var(--text); }
+
+  /* Segmented tabs */
+  .src-tabs {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+    padding: 4px;
+    background: var(--glass-strong);
+    border: 1px solid var(--stroke);
+    border-radius: 12px;
+    margin-top: 4px;
+  }
+  .src-tabs .seg {
+    background: transparent; color: var(--muted);
+    border: 1px solid transparent;
+    border-radius: 9px;
+    padding: 10px 12px;
+    font-size: 14px; font-weight: 500; font-family: inherit;
+    cursor: pointer;
+    transition: all .2s ease;
+  }
+  .src-tabs .seg:hover { color: var(--text); }
+  .src-tabs .seg.active {
+    background: rgba(255,255,255,0.10);
+    color: var(--text);
+    border-color: var(--stroke-strong);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.1) inset;
+  }
+
+  .hidden { display: none !important; }
+
+  /* Camera */
+  video, canvas {
+    width: 100%; aspect-ratio: 4/3; object-fit: cover;
+    border-radius: 14px; border: 1px solid var(--stroke);
+    background: rgba(0,0,0,0.25); margin-top: 10px;
+  }
+  .cam-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+
+  /* Result */
+  .result {
+    margin-top: 26px; display: none;
+    border-top: 1px solid var(--stroke);
+    padding-top: 24px;
+  }
+  .result.show { display: block; }
+  .bdi-label {
+    color: var(--muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.14em;
+    text-align: center;
+  }
+  .bdi-big {
+    font-size: 84px; font-weight: 800;
+    letter-spacing: -0.04em;
+    background: linear-gradient(180deg, #7ef4a8 0%, #31c56c 100%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    line-height: 1;
+    text-align: center;
+    margin: 6px 0 4px;
+  }
+  .photo-wrap { margin-top: 18px; display: flex; justify-content: center; }
+  .photo-wrap figure { margin: 0; width: min(280px, 100%); }
+  .photo-wrap img {
+    width: 100%; aspect-ratio: 1/1; object-fit: cover;
+    border-radius: 16px;
+    border: 1px solid var(--stroke);
+    background: rgba(0,0,0,0.25);
+    box-shadow: 0 20px 40px -20px rgba(0,0,0,0.7);
+  }
+  .photo-wrap figcaption {
+    color: var(--muted); font-size: 11px; margin-top: 8px;
+    text-align: center; text-transform: uppercase; letter-spacing: 0.1em;
+  }
+
+  .stats-btn { margin-top: 20px; font-size: 13px; padding: 10px 14px; }
+
+  .meta {
+    margin-top: 14px;
+    padding: 14px 16px;
+    background: var(--glass-strong);
+    border: 1px solid var(--stroke);
+    border-radius: 12px;
+    font-size: 13px; color: var(--muted);
+    display: none;
+  }
+  .meta.show { display: block; }
+  .meta .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+  .meta .row + .row { border-top: 1px solid var(--stroke); }
+  .meta .k { color: var(--muted); }
+  .meta .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-align: right; word-break: break-all; }
+
+  .err {
+    color: #fca5a5; margin-top: 14px; font-size: 13px;
+    padding: 10px 14px;
+    background: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: 10px;
+    display: none;
+  }
+  .err.show { display: block; }
+
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid rgba(5, 33, 15, 0.25);
+    border-top-color: #05210f;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    vertical-align: -2px;
+    margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>BDI Estimator</h1>
+      <p class="sub">Estimate your drink's Beverage Degradation Index.</p>
+    </div>
+
+    <div class="card">
+      <form id="form">
+        <label for="drink">Drink</label>
+        <select id="drink" name="drink" class="field" required>
+          {% for key, label in drinks.items() %}
+            <option value="{{ key }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+
+        <label>Photo source</label>
+        <div class="src-tabs">
+          <button type="button" id="tab-upload" class="seg active">Upload file</button>
+          <button type="button" id="tab-camera" class="seg">Use camera</button>
+        </div>
+
+        <div id="pane-upload">
+          <label for="image">Choose a photo</label>
+          <input id="image" name="image" type="file" accept="image/*" class="field">
+        </div>
+
+        <div id="pane-camera" class="hidden">
+          <label>Camera</label>
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="canvas" class="hidden"></canvas>
+          <div class="cam-controls">
+            <button type="button" id="snap" class="btn">Capture</button>
+            <button type="button" id="retake" class="btn hidden">Retake</button>
+          </div>
+        </div>
+
+        <button id="submit" type="submit" class="btn btn-primary">Analyze</button>
+        <div id="err" class="err"></div>
+      </form>
+
+      <div id="result" class="result">
+        <div class="bdi-label">Estimated BDI</div>
+        <div class="bdi-big" id="bdi">–</div>
+
+        <div class="photo-wrap">
+          <figure>
+            <img id="uploaded" alt="your photo">
+            <figcaption>Your photo</figcaption>
+          </figure>
+        </div>
+
+        <button type="button" id="stats-btn" class="btn btn-ghost stats-btn">View statistics</button>
+        <div id="meta" class="meta">
+          <div class="row"><span class="k">Drink</span><span class="v" id="drink-out"></span></div>
+          <div class="row"><span class="k">Matched file</span><span class="v" id="file-out"></span></div>
+          <div class="row"><span class="k">Similarity</span><span class="v" id="score-out"></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const form = document.getElementById('form');
+const btn = document.getElementById('submit');
+const err = document.getElementById('err');
+const result = document.getElementById('result');
+
+const tabUpload = document.getElementById('tab-upload');
+const tabCamera = document.getElementById('tab-camera');
+const paneUpload = document.getElementById('pane-upload');
+const paneCamera = document.getElementById('pane-camera');
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const snapBtn = document.getElementById('snap');
+const retakeBtn = document.getElementById('retake');
+const fileInput = document.getElementById('image');
+
+let mode = 'upload';      // 'upload' | 'camera'
+let stream = null;
+let capturedBlob = null;  // set after camera capture
+
+async function startCamera() {
+  if (stream) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment' }, audio: false
+    });
+    video.srcObject = stream;
+  } catch (e) {
+    err.textContent = 'Camera unavailable: ' + e.message;
+    err.classList.add('show');
+  }
+}
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.srcObject = null;
+  }
+}
+
+tabUpload.addEventListener('click', () => {
+  mode = 'upload';
+  tabUpload.classList.add('active');
+  tabCamera.classList.remove('active');
+  paneUpload.classList.remove('hidden');
+  paneCamera.classList.add('hidden');
+  stopCamera();
+});
+tabCamera.addEventListener('click', () => {
+  mode = 'camera';
+  tabCamera.classList.add('active');
+  tabUpload.classList.remove('active');
+  paneCamera.classList.remove('hidden');
+  paneUpload.classList.add('hidden');
+  // reset capture state
+  capturedBlob = null;
+  canvas.classList.add('hidden');
+  video.classList.remove('hidden');
+  snapBtn.classList.remove('hidden');
+  retakeBtn.classList.add('hidden');
+  startCamera();
+});
+
+snapBtn.addEventListener('click', () => {
+  if (!stream) return;
+  const w = video.videoWidth, h = video.videoHeight;
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+  canvas.classList.remove('hidden');
+  video.classList.add('hidden');
+  snapBtn.classList.add('hidden');
+  retakeBtn.classList.remove('hidden');
+  canvas.toBlob((blob) => { capturedBlob = blob; }, 'image/jpeg', 0.92);
+});
+document.getElementById('stats-btn').addEventListener('click', () => {
+  const meta = document.getElementById('meta');
+  const btn = document.getElementById('stats-btn');
+  const showing = meta.classList.toggle('show');
+  btn.textContent = showing ? 'Hide statistics' : 'View statistics';
+});
+
+retakeBtn.addEventListener('click', () => {
+  capturedBlob = null;
+  canvas.classList.add('hidden');
+  video.classList.remove('hidden');
+  snapBtn.classList.remove('hidden');
+  retakeBtn.classList.add('hidden');
+});
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  err.textContent = ''; err.classList.remove('show');
+
+  let blob = null, previewUrl = null;
+  if (mode === 'upload') {
+    const f = fileInput.files[0];
+    if (!f) { err.textContent = 'Please choose a photo.'; err.classList.add('show'); return; }
+    blob = f;
+    previewUrl = URL.createObjectURL(f);
+  } else {
+    if (!capturedBlob) { err.textContent = 'Please capture a photo first.'; err.classList.add('show'); return; }
+    blob = capturedBlob;
+    previewUrl = URL.createObjectURL(capturedBlob);
+  }
+
+  document.getElementById('uploaded').src = previewUrl;
+  const drink = document.getElementById('drink').value;
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Analyzing…';
+
+  try {
+    const fd = new FormData();
+    fd.append('image', blob, 'capture.jpg');
+    fd.append('drink', drink);
+    const res = await fetch('/analyze', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+
+    document.getElementById('bdi').textContent = data.bdi;
+    document.getElementById('drink-out').textContent =
+      form.querySelector('#drink option:checked').textContent;
+    document.getElementById('file-out').textContent = data.matched_file;
+    document.getElementById('score-out').textContent =
+      data.similarity_score.toFixed(4);
+    // reset stats panel to hidden on each new analysis
+    document.getElementById('meta').classList.remove('show');
+    document.getElementById('stats-btn').textContent = 'View statistics';
+    result.classList.add('show');
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML, drinks=DRINKS)
+
+
+@app.route("/images/<path:filename>")
+def images(filename):
+    return send_from_directory(IMAGES_DIR, filename)
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    drink = request.form.get("drink", "").strip()
+    file = request.files.get("image")
+    if not drink or drink not in DRINKS:
+        return jsonify({"error": "Invalid or missing drink"}), 400
+    if not file:
+        return jsonify({"error": "Missing image"}), 400
+
+    query_hist = compute_hist_from_bytes(file.read())
+    if query_hist is None:
+        return jsonify({"error": "Could not decode uploaded image"}), 400
+    qh = query_hist.astype("float32")
+
+    # First, sanity-check that this photo looks like *any* drink we know
+    # by comparing against every reference. If even the best overall match
+    # is poor, reject it as "not a drink".
+    global_best = -1.0
+    for fn, (bdi, h) in REFERENCE.items():
+        s = float(cv2.compareHist(qh, h.astype("float32"), cv2.HISTCMP_CORREL))
+        if s > global_best:
+            global_best = s
+
+    NOT_A_DRINK_THRESHOLD = 0.35
+    if global_best < NOT_A_DRINK_THRESHOLD:
+        return jsonify({
+            "error": "That photo doesn't look like a drink. Please upload a "
+                     "photo of your beverage."
+        }), 400
+
+    # Filter references to those matching this drink's prefix
+    candidates = [(fn, bdi, h) for fn, (bdi, h) in REFERENCE.items()
+                  if fn.startswith(drink)]
+    if not candidates:
+        return jsonify({"error": f"No reference images for {drink}"}), 404
+
+    best_file, best_bdi, best_score = None, None, -1.0
+    for fn, bdi, h in candidates:
+        score = float(cv2.compareHist(qh, h.astype("float32"),
+                                      cv2.HISTCMP_CORREL))
+        if score > best_score:
+            best_score = score
+            best_file = fn
+            best_bdi = bdi
+
+    return jsonify({
+        "bdi": best_bdi,
+        "matched_file": best_file,
+        "similarity_score": best_score,
+    })
+
+
+# Load reference histograms on import so it works under gunicorn too.
+load_references()
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
